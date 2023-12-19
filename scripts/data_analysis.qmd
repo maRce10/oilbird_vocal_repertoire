@@ -1,0 +1,446 @@
+---
+title: Data analysis
+subtitle: Oilbird vocalizations
+author: Marcelo Araya-Salas
+date: "`r Sys.Date()`"
+toc: true
+toc-depth: 3
+toc-location: left
+number-sections: true
+highlight-style: pygments
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    code-copy: true
+    embed-resources: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+&nbsp; 
+
+
+<!-- this code add line numbers to code blocks -->
+<!-- only works when code folding is not used in yaml (code_folding: show) -->
+
+```{=html}
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+```
+
+```{r add link to github repo, echo = FALSE, results='asis'}
+
+# print link to github repo if any
+if (file.exists("./.git/config")){
+  config <- readLines("./.git/config")
+  url <- grep("url",  config, value = TRUE)
+  url <- gsub("\\turl = |.git$", "", url)[2]
+  cat("\nSource code and data found at [", url, "](", url, ")", sep = "")
+  }
+
+```
+
+```{r setup style, echo = FALSE, message = FALSE, warning=FALSE}
+
+# options to customize chunk outputs
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors", # for code line numbers
+  tidy.opts = list(width.cutoff = 65), 
+  tidy = TRUE,
+  message = FALSE,
+  warning = FALSE
+ )
+
+knitr::opts_knit$set(root.dir = "..")
+
+```
+
+
+# Load packages {.unnumbered .unlisted}
+```{r load packages}
+
+# load function from sketchy
+source("https://raw.githubusercontent.com/maRce10/sketchy/main/R/load_packages.R")
+
+# install/ load packages
+sketchy::load_packages(packages = c(github = "maRce10/Rraven", github = "maRce10/ohun", github = "maRce10/warbleR", "viridis", "caret", "randomForest", "umap", "mclust"))
+
+```
+
+# Reading annotations
+```{r}
+clps <- "./DiegoMejia_Grabaciones/5_min_clips/"
+spctrs <- "./DiegoMejia_Grabaciones/spectros/"
+
+pth2 <- "./DiegoMejia_Grabaciones/Oilbird_Anotations Diego Mejía"
+
+anns <- imp_raven(pth2, recursive = TRUE, warbler.format = TRUE, name.from.file = TRUE,ext.case = "lower", all.data = TRUE)
+
+
+empty_recs <- .Options$Rraven$`empty selection table files` 
+
+cs <- check_sels(anns, path = clps)
+
+anns <- anns[cs$check.res == "OK", ]
+
+feature_reference(anns, units = c("s", "kHz"))
+
+anns2 <- anns[anns$Adulto == "y" & anns$Sobrelapamiento == "n", ]
+
+write.csv(anns2, "./data/processed/adult_annotations.csv", row.names = FALSE)
+```
+
+# Print spectrograms
+```{r, eval = FALSE}
+
+anns <- read.csv("./data/processed/adult_annotations.csv")
+
+spectrograms(anns, flim = c(0, 11), collevels = seq(-120, 0, 5), pal =  viridis::viridis, path = clps, dest.path = spctrs, propwidth = TRUE)
+
+```
+
+# Measure acoustic features
+```{r, eval = FALSE}
+anns <- read.csv("./data/processed/adult_annotations.csv")
+
+anns$type <- NA
+dirs <- list.dirs(path = "./DiegoMejia_Grabaciones/Espectros Categorizados")[-1]
+
+for(x in dirs)
+anns$type[filter_sels(anns, path = x, index = TRUE)] <- basename(x)
+
+table(anns$type)
+
+check_sels(anns, path = clps)
+
+
+acoust_feat <- spectro_analysis(anns, parallel = 20, path = clps)
+mfcs <- mfcc_stats(anns, parallel = 20, path = clps)
+
+acoust_feat <- cbind(acoust_feat, mfcs[, -c(1, 2)])
+
+acoust_feat$type <- anns$type
+
+write.csv(acoust_feat, "./data/processed/acoustic_features.csv", row.names = FALSE)
+
+```
+
+# Random Forest classification
+```{r, eval = FALSE}
+
+acoust_feat <- read.csv("./data/processed/acoustic_features.csv")
+
+acoust_feat <- acoust_feat[complete.cases(acoust_feat), ]
+
+# acoust_feat <- acoust_feat[!is.na(acoust_feat$type), ]
+acoust_feat$type <- make.names(acoust_feat$type)
+acoust_feat$type <- factor(acoust_feat$type)
+
+# Create data subsets
+partition <- createDataPartition(
+    y = acoust_feat$type,
+    times = 1,
+    p = 0.75,
+    list = FALSE
+)
+
+trainset <- acoust_feat[partition, -c(1, 2)]
+testset <- acoust_feat[-partition, -c(1, 2)]
+
+trcontrol <-
+    trainControl(
+        method = "repeatedcv",
+        number = 100,
+        savePredictions = TRUE,
+        classProbs = TRUE,
+        returnResamp = "all",
+        sampling = "down"
+    )
+
+pred_model <-
+    train(
+        type ~ .,
+        data = trainset,
+        method = "rf",
+        trControl = trcontrol,
+        metric = "Accuracy",
+        preProcess = "scale", 
+        proximity = TRUE
+    )
+
+# save confusion matrix
+conf_mat <-
+    confusionMatrix(predict(pred_model, testset), testset$type)
+
+conf_df <- as.data.frame(conf_mat$table)
+
+conf_df$total <-
+    sapply(conf_df$Reference, function(x)
+        sum(testset$type ==
+                x))
+
+conf_df$proportion <- conf_df$Freq / conf_df$total
+
+# fit model on complete data set
+best_rf_model <- pred_model$finalModel
+
+all_rf_model <- randomForest(
+  type ~ .,
+  data = acoust_feat,  # Your entire dataset
+  proximity = TRUE,  # Include proximity matrix
+  ntree = best_rf_model$ntree,  # Number of trees
+  mtry = best_rf_model$mtry,    # Number of variables tried for splitting at each node
+  nodesize = best_rf_model$nodesize,  # Minimum size of terminal nodes
+  maxnodes = best_rf_model$maxnodes  # Maximum number of terminal nodes
+)
+
+
+saveRDS(
+    list(
+        pred_model_bb = pred_model,
+        conf_mat_bb = conf_mat,
+        confusion_df_bb = conf_df,
+        testset_bb = testset,
+        all_rf_model = all_rf_model,
+        data = acoust_feat
+    ),
+    "./data/processed/random_forest_model_call_types.RDS"
+)
+
+```
+
+```{r}
+
+rf_model_results <- readRDS("./data/processed/random_forest_model_call_types.RDS")
+
+# print confusion matrix results
+rf_model_results$conf_mat_bb$overall
+
+confusion_df <- rf_model_results$confusion_df_bb
+
+ggplot(confusion_df, aes(x = Reference, y = Prediction, fill = proportion)) +
+    geom_tile() + theme_bw() + coord_equal() + scale_fill_distiller(palette = "Greens",
+    direction = 1) + geom_text(aes(label = round(proportion, 2)),
+    color = "black", size = 3) + theme_classic() + theme(axis.text.x = element_text(color = "black",
+    size = 11, angle = 30, vjust = 0.8, hjust = 0.8))
+
+
+```
+
+# Manual labels
+
+## UMAP visualization
+```{r, eval= FALSE}
+
+umap_result <- umap(rf_model_results$all_rf_model$proximity, n_neighbors = 15,
+    n_components = 2)
+
+# Create a data frame with the UMAP results
+umap_df <- data.frame(UMAP1 = umap_result$layout[, 1], UMAP2 = umap_result$layout[,
+    2], type = rf_model_results$data$type)
+
+umap_df$pred.type <- predict(rf_model_results$pred_model_bb, rf_model_results$data)
+  # predict(object = rf_model_results$all_rf_model,
+    # rf_model_results$data)
+
+mod_umap <- Mclust(umap_df[, 1:2])
+
+summary(mod_umap)
+
+grouping_umap <- as.factor(mod_umap$classification)
+umap_df$group <-  mod_umap$classification
+
+write.csv(umap_df, "./data/processed/umap_on_rf_proximity_call_types.csv",
+    row.names = FALSE)
+
+```
+
+```{r}
+umap_df <- read.csv("./data/processed/umap_on_rf_proximity_call_types.csv")
+
+# Create a scatterplot
+gg_umap_loc <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = type,
+    fill = type, shape = type)) + geom_point(size = 4) + ylim(c(-7, 7)) + scale_color_viridis_d(alpha = 0.3,
+    begin = 0.1, end = 0.8) + scale_fill_viridis_d(alpha = 0.2, begin = 0.1,
+    end = 0.8) + theme_classic(base_size = 20) + labs(x = "UMAP1",
+    y = "UMAP2", color = "Call type", fill = "Call type", shape = "Call type") + scale_shape_manual(values=rep(c(1:2, 16:21), 3)[1:16])
+
+gg_umap_loc
+
+```
+
+
+# Unsupervised labels
+
+## UMAP visualization
+```{r}
+
+umap_df <- read.csv("./data/processed/umap_on_rf_proximity_call_types.csv")
+
+# Create a scatterplot
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = as.factor(group),
+    fill = as.factor(group), shape = as.factor(group))) + geom_point(size = 4) + ylim(c(-7, 7)) + scale_color_viridis_d(alpha = 0.3,
+    begin = 0.1, end = 0.8) + scale_fill_viridis_d(alpha = 0.2, begin = 0.1,
+    end = 0.8) + theme_classic(base_size = 20) + labs(x = "UMAP1",
+    y = "UMAP2", color = "Call type", fill = "Call type", shape = "Call type") + scale_shape_manual(values=rep(c(1:2, 16:22), 3)[1:9])
+
+```
+
+# Match between manual and unsupervised classifications
+
+All calls
+```{r}
+# confusion matrix
+conf_df <- aggregate(UMAP2 ~ type + group, umap_df, length)
+
+names(conf_df)[ncol(conf_df)] <- "Freq"
+
+conf_df$total <-
+    sapply(conf_df$group, function(x)
+        sum(umap_df$group ==
+                x))
+
+conf_df$proportion <- conf_df$Freq / conf_df$total
+
+conf_df <- conf_df[order(conf_df$proportion), ]
+
+conf_df$group <- factor(conf_df$group)
+
+conf_df$type <- factor(conf_df$type)
+
+ggplot(conf_df, aes(y = group, x = type, fill = proportion)) +
+    geom_tile() + theme_bw() + coord_equal() + scale_fill_distiller(palette = "Greens",
+    direction = 1) + geom_text(aes(label = round(proportion, 2)),
+    color = "black", size = 3) + theme_classic() + theme(axis.text.x = element_text(color = "black",
+    size = 11, angle = 30, vjust = 0.8, hjust = 0.8)) +
+  labs(y = "Unsupervised categories", x = "Manual categories")
+```
+
+All calls excluding proportions lower than 5%
+```{r}
+# confusion matrix
+conf_df <- aggregate(UMAP2 ~ type + group, umap_df, length)
+
+names(conf_df)[ncol(conf_df)] <- "Freq"
+
+conf_df$total <-
+    sapply(conf_df$group, function(x)
+        sum(umap_df$group ==
+                x))
+
+conf_df$proportion <- conf_df$Freq / conf_df$total
+
+conf_df <- conf_df[order(conf_df$proportion), ]
+
+conf_df$group <- factor(conf_df$group)
+
+conf_df$type <- factor(conf_df$type)
+
+conf_df <- conf_df[conf_df$proportion > 0.05, ]
+
+ggplot(conf_df, aes(y = group, x = type, fill = proportion)) +
+    geom_tile() + theme_bw() + coord_equal() + scale_fill_distiller(palette = "Greens",
+    direction = 1) + geom_text(aes(label = round(proportion, 2)),
+    color = "black", size = 3) + theme_classic() + theme(axis.text.x = element_text(color = "black",
+    size = 11, angle = 30, vjust = 0.8, hjust = 0.8)) +
+  labs(y = "Unsupervised categories", x = "Manual categories")
+```
+
+Only those that were correctly classified based on manual categories
+```{r}
+# confusion matrix
+conf_df <- aggregate(UMAP2 ~ type + group, umap_df[umap_df$type == umap_df$pred.type,], length)
+
+names(conf_df)[ncol(conf_df)] <- "Freq"
+
+conf_df$total <-
+    sapply(conf_df$group, function(x)
+        sum(umap_df$group[umap_df$type == umap_df$pred.type] ==
+                x))
+
+conf_df$proportion <- conf_df$Freq / conf_df$total
+
+conf_df <- conf_df[order(conf_df$proportion), ]
+
+conf_df$group <- factor(conf_df$group)
+
+conf_df$type <- factor(conf_df$type)
+
+ggplot(conf_df, aes(y = group, x = type, fill = proportion)) +
+    geom_tile() + theme_bw() + coord_equal() + scale_fill_distiller(palette = "Greens",
+    direction = 1) + geom_text(aes(label = round(proportion, 2)),
+    color = "black", size = 3) + theme_classic() + theme(axis.text.x = element_text(color = "black",
+    size = 11, angle = 30, vjust = 0.8, hjust = 0.8)) +
+  labs(y = "Unsupervised categories", x = "Manual categories")
+```
+
+Only those that were correctly classified based on manual categories lower than 5%
+```{r}
+# confusion matrix
+conf_df <- aggregate(UMAP2 ~ type + group, umap_df[umap_df$type == umap_df$pred.type,], length)
+
+names(conf_df)[ncol(conf_df)] <- "Freq"
+
+conf_df$total <-
+    sapply(conf_df$group, function(x)
+        sum(umap_df$group[umap_df$type == umap_df$pred.type] ==
+                x))
+
+conf_df$proportion <- conf_df$Freq / conf_df$total
+
+conf_df <- conf_df[order(conf_df$proportion), ]
+
+conf_df$group <- factor(conf_df$group)
+
+conf_df$type <- factor(conf_df$type)
+
+conf_df <- conf_df[conf_df$proportion > 0.05, ]
+
+ggplot(conf_df, aes(y = group, x = type, fill = proportion)) +
+    geom_tile() + theme_bw() + coord_equal() + scale_fill_distiller(palette = "Greens",
+    direction = 1) + geom_text(aes(label = round(proportion, 2)),
+    color = "black", size = 3) + theme_classic() + theme(axis.text.x = element_text(color = "black",
+    size = 11, angle = 30, vjust = 0.8, hjust = 0.8)) +
+  labs(y = "Unsupervised categories", x = "Manual categories")
+```
+
+## Chi-square on contingency table
+
+```{r}
+tbl <- xtabs(Freq ~ group + type, conf_df)
+
+chisq.test(tbl)
+
+```
+
+<div class="alert alert-success">
+
+# Takeaways {.unnumbered .unlisted}
+
+- 
+
+</div>
+
+&nbsp;
+
+<!-- '---' adds a gray vertical line -->
+
+---
+
+&nbsp; 
+ 
+ <!-- add packages used, system details and versions  -->
+ 
+# Session information {.unnumbered .unlisted}
+
+```{r session info, echo=F}
+
+sessionInfo()
+
+```
